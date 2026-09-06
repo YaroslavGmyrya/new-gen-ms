@@ -1,0 +1,6 @@
+duplex_mode = "fdd"
+dl_bw = "rb6"
+scs_khz = "khz15"
+fs = 1.92
+cp_type = "normal"
+record_duration_ms = 10
