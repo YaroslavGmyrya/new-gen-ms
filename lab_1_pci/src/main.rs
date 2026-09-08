@@ -14,7 +14,7 @@ mod correlator;
 mod fft;
 mod ofdm_symbol;
 mod pss;
-mod sample_reader;
+mod samples_reader;
 mod sss;
 mod types;
 
@@ -23,12 +23,44 @@ const SAMPLES_FILE_PATH: &str = "lte_pss_sss_pbch_iq_s16le.pcm";
 const COUNT_OF_ZC_ROOTS: usize = 3;
 const ZC_ROOTS: [u8; COUNT_OF_ZC_ROOTS] = [25, 29, 34];
 
+const NC: usize = 1600;
+
+pub fn generate_gold_sequence(c_init: u32, length: usize) -> Vec<u8> {
+    const NC: usize = 1600;
+    let total_len = length + NC;
+
+    let mut x1 = vec![0u8; total_len];
+    x1[0] = 1;
+
+    let mut x2 = vec![0u8; total_len];
+    for i in 0..31 {
+        x2[i] = ((c_init >> i) & 1) as u8;
+    }
+
+    for n in 0..(total_len - 31) {
+        x1[n + 31] = (x1[n + 3] + x1[n]) % 2;
+        x2[n + 31] = (x2[n + 3] + x2[n + 2] + x2[n + 1] + x2[n]) % 2;
+    }
+
+    let mut c = vec![0u8; length];
+    for n in 0..length {
+        c[n] = (x1[n + NC] + x2[n + NC]) % 2;
+    }
+
+    c
+}
+
+fn descramble(bits: &[u8], c_init: u32) -> Vec<u8> {
+    let c = generate_gold_sequence(c_init, bits.len());
+    bits.iter().zip(c.iter()).map(|(&b, &c)| b ^ c).collect()
+}
+
 fn main() {
     // 0. Plot grid setting
     let layout = Layout::new()
         .grid(
             LayoutGrid::new()
-                .rows(4)
+                .rows(5)
                 .columns(1)
                 .pattern(plotly::layout::GridPattern::Independent),
         )
@@ -37,6 +69,7 @@ fn main() {
         .y_axis2(Axis::new().title(Title::new().text("Zadov-Chu")))
         .y_axis3(Axis::new().title(Title::new().text("PSS correlation")))
         .y_axis4(Axis::new().title(Title::new().text("CP correlation")))
+        .y_axis5(Axis::new().title(Title::new().text("PBCH Constellation")))
         .width(1600)
         .height(1500);
 
@@ -53,7 +86,7 @@ fn main() {
     };
 
     // 2. Read samples
-    let samples: Vec<Sample> = match sample_reader::pcm_reader(SAMPLES_FILE_PATH, &config) {
+    let samples: Vec<Sample> = match samples_reader::pcm_reader(SAMPLES_FILE_PATH, &config) {
         Ok(samples) => samples,
         Err(err) => {
             eprintln!(
@@ -218,6 +251,34 @@ fn main() {
     }
 
     println!("{}, {}", sss_id, tmp);
+
+    // 13. Find PBCH range
+    let start_pbch = start_pss_index + config.cp_type.size() as usize + config.dl_bw.fft_size() + 1;
+    let end_pbch: usize =
+        start_pbch + 4 * (config.dl_bw.fft_size() + config.cp_type.size() as usize);
+
+    let pbch_samples = samples[start_pbch..end_pbch].to_vec();
+    println!("PBCH SAMPLES SIZE: {}", pbch_samples.len());
+
+    let (pbch_bits, pbch_re) =
+        OfdmSymbol::samples_to_symbols(pbch_samples, config.dl_bw, config.cp_type);
+
+    println!(
+        "PBCH BITS: {}",
+        pbch_re.iter().flatten().collect::<Vec<_>>().len()
+    );
+
+    // 14. Plot PBCH constellation
+
+    let pbch_constellation = Scatter::new(
+        pbch_re.iter().flatten().map(|sample| sample.re).collect(),
+        pbch_re.iter().flatten().map(|sample| sample.im).collect(),
+    )
+    .mode(Mode::Markers)
+    .x_axis("x5")
+    .y_axis("y5");
+
+    plots.add_trace(pbch_constellation);
 
     plots.show();
 }
