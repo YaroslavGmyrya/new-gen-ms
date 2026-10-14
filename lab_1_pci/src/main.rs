@@ -19,7 +19,7 @@ mod sss;
 mod types;
 
 const CONFIG_FILE_PATH: &str = "Config.toml";
-const SAMPLES_FILE_PATH: &str = "lte_pss_sss_pbch_iq_s16le.pcm";
+const SAMPLES_FILE_PATH: &str = "new_samples.pcm";
 const COUNT_OF_ZC_ROOTS: usize = 3;
 const ZC_ROOTS: [u8; COUNT_OF_ZC_ROOTS] = [25, 29, 34];
 
@@ -98,6 +98,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    println!("SAMPLES_COUNT: {}", samples.len());
 
     // 3. Plot signal
     let timeline: Vec<f32> = config.get_timeline();
