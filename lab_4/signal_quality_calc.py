@@ -3,46 +3,6 @@ import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from itertools import batched
 
-def generate_zc(root):
-    sequence = []
-
-    for n in range(0, 31):
-        phase = -np.pi * root * n * (n + 1) / 63
-        value = np.exp(1j * phase)
-        sequence.append(value)
-
-    for n in range(31, 62):
-        phase = -np.pi * root * (n + 1) * (n + 2) / 63
-        value = np.exp(1j * phase)
-        sequence.append(value)
-
-    return sequence
-
-
-def map_to_center(sequence, fft_size):
-    if fft_size < 64:
-        raise ValueError("fft_size must be at least 64")
-
-    grid = np.zeros(int(fft_size), dtype=np.complex64)
-
-    for i in range(31):
-        negative_index = fft_size - 31 + i
-        grid[negative_index] = sequence[i]
-
-    for i in range(31):
-        positive_index = 1 + i
-        grid[positive_index] = sequence[31 + i]
-
-    return grid
-
-
-def get_pss_symbol_index(cp_type):
-    if cp_type == "normal":
-        return 6
-    if cp_type == "extended":
-        return 5
-
-
 def get_cp_length(fft_size, cp_type, symbol_index):
     if cp_type == "extended":
         base_length = 512
@@ -54,62 +14,6 @@ def get_cp_length(fft_size, cp_type, symbol_index):
 
     cp_length = base_length * fft_size // 2048
     return cp_length
-
-
-
-def run_ifft(grid, fft_size):
-    return np.fft.ifft(grid, fft_size)
-
-
-
-def add_cyclic_prefix(symbol, cp_length):
-    prefix = symbol[len(symbol) - cp_length:]
-    return np.concatenate((prefix, symbol))
-
-
-def generate_pss(root, fft_size, cp_type):
-    sequence = generate_zc(root)
-    grid = map_to_center(sequence, fft_size)
-    useful_symbol = run_ifft(grid, fft_size)
-
-    symbol_index = get_pss_symbol_index(cp_type)
-    cp_length = get_cp_length(fft_size, cp_type, symbol_index)
-    full_symbol = add_cyclic_prefix(useful_symbol, cp_length)
-
-    return full_symbol, useful_symbol
-
-
-
-def normalize_samples(samples):
-    samples = samples.astype(np.complex64)
-    samples = samples - np.mean(samples)
-
-    rms = np.sqrt(np.mean(np.abs(samples) ** 2))
-    if rms == 0:
-        raise ValueError("samples contain only zeros")
-
-    return (samples / rms).astype(np.complex64)
-
-def norm_corr(x, y):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    
-    y_centered = y - np.mean(y)
-    y_energy = np.sum(y_centered**2)
-    
-    corr = np.correlate(x, y_centered, mode='valid')
-    
-    ones = np.ones_like(y)
-    x_sq_sum = np.convolve(x**2, ones, mode='valid')
-    x_sum = np.convolve(x, ones, mode='valid')
-    
-    x_energy = x_sq_sum - (x_sum**2) / len(y)
-    
-    x_energy = np.maximum(x_energy, 0) 
-    
-    norm_factor = np.sqrt(x_energy * y_energy)
-    
-    return np.divide(corr, norm_factor, out=np.zeros_like(corr), where=norm_factor!=0)
 
 def get_ofdm_symbols(frame, fft_size, cp_type='normal'):
     symbols = []
@@ -158,38 +62,160 @@ def get_useful_re(symbols, fft_size, num_rb=6):
 
     return result
 
+def path_loss(f_mhz, d_km, hb=30.0, hm=1.5, area="small"):
+    lf = np.log10(f_mhz)
+    lhb = np.log10(hb)
 
-def extract_rs_signals(useful_re_matrix, cell_id=0, start_sym_index=0):
-    v_shift = cell_id % 6
-    
-    useful_re_matrix = np.asarray(useful_re_matrix)
-    num_symbols, num_re = useful_re_matrix.shape
-    
-    data_matrix = np.zeros((num_symbols, num_re), dtype=complex)
-    rs_matrix = np.zeros((num_symbols, num_re), dtype=complex)
-    
-    for i in range(num_symbols):
-        global_idx = start_sym_index + i
-        idx_in_slot = global_idx % 7
-        
-        current_symbol = useful_re_matrix[i, :]
-        
-        if idx_in_slot == 0:
-            rs_indices = np.arange(v_shift, num_re, 6)
-        elif idx_in_slot == 4:
-            v_shift_4 = (v_shift + 3) % 6
-            rs_indices = np.arange(v_shift_4, num_re, 6)
+    if area == "metro":
+        if f_mhz <= 200:
+            a = 8.29 * np.log10(1.54 * hm) ** 2 - 1.1
         else:
-            data_matrix[i, :] = current_symbol
+            a = 3.2 * np.log10(11.75 * hm) ** 2 - 4.97
+    else:
+        a = (1.1 * lf - 0.7) * hm - (1.56 * lf - 0.8)
+
+    if area == "suburban":
+        C = -2 * np.log10(f_mhz / 28) ** 2 - 5.4
+    elif area == "rural":
+        C = -4.78 * lf ** 2 + 18.33 * lf - 40.98
+    elif area == "metro" and f_mhz > 1500:
+        C = 3.0
+    else:
+        C = 0.0
+
+    if f_mhz <= 1500:
+        A = 69.55 + 26.16 * lf - 13.82 * lhb - a
+    else:
+        A = 46.3 + 33.9 * lf - 13.82 * lhb - a
+
+    B = 44.9 - 6.55 * lhb
+    
+    return A + B * np.log10(d_km) + C
+
+def add_AWGN(samples, SINR):
+    p_signal = np.mean(np.abs(samples) ** 2)
+    p_noise = p_signal / 10 ** (SINR / 10)
+    noise = np.sqrt(p_noise / 2) * (np.random.randn(len(samples)) + 1j * np.random.randn(len(samples)))
+    return samples + noise
+
+
+def calc_RSRP(real_rs):
+    real_rs = batched(real_rs, 12)
+    
+    result=[]
+    
+    for batch in real_rs:
+        power_counter = 0
+        for rs in batch:
+            power_counter += np.abs(rs)
+        
+        avg = power_counter / len(batch)
+        db = 10*np.log10(avg)
+        result.append(db)
+        
+    return result
+
+def calc_RSSI(samples):
+    real_rs = batched(samples, 72)
+    
+    result=[]
+    
+    for i,batch in enumerate(real_rs):
+        power_counter = 0
+        
+        if i % 7 != 0 and i % 4 != 0:
             continue
+        
+        for sample in batch:
+            power_counter += np.abs(sample)
+        
+        avg = power_counter / len(batch)
+        db = 10*np.log10(avg)
+        result.append(db)
+        
+    return result
+        
+def add_cp(samples, fft_size, cp_type):
+    new_symbols = []
+    for i, symbol in enumerate(samples):
+        # ИСПРАВЛЕНИЕ: гарантируем, что работаем с массивом NumPy
+        symbol = np.asarray(symbol) 
+        
+        cp_len = get_cp_length(fft_size, cp_type, i)
+        
+        # Теперь срез и конкатенация выполняются средствами NumPy корректно
+        cp = symbol[-cp_len:] 
+        symbol_with_cp = np.concatenate((cp, symbol))
+        
+        new_symbols.append(symbol_with_cp)
             
-        is_rs = np.zeros(num_re, dtype=bool)
-        is_rs[rs_indices] = True
-        
-        rs_matrix[i, is_rs] = current_symbol[is_rs]
-        data_matrix[i, ~is_rs] = current_symbol[~is_rs]
-        
-    return data_matrix, rs_matrix
+    return new_symbols
+            
+def map_to_grid(symbols, fft_size, num_rb=6):
+    half_re = num_rb * 12 // 2
+    center_idx = fft_size // 2
+
+    result = []
+    for sym in symbols:
+        sym = np.asarray(sym)
+        grid = np.zeros(fft_size, dtype=np.complex64)
+        grid[center_idx - half_re : center_idx] = sym[:half_re]            # нижняя половина
+        grid[center_idx + 1 : center_idx + 1 + half_re] = sym[half_re:]    # верхняя половина (DC пропущен)
+        result.append(grid)
+    return result
+
+
+def ifft(grids, fft_size):
+    return [np.fft.ifft(np.fft.ifftshift(g), fft_size) for g in grids]
+
+
+import numpy as np
+
+# Параметры (1.4 МГц, CP normal)
+N_RB      = 6
+N_SC_RB   = 12
+N_USED    = N_RB * N_SC_RB          # 72 полезных поднесущих
+N_FFT     = 128
+FS        = 1.92e6
+N_SLOTS   = 20
+SYM_SLOT  = 7                        # normal CP
+N_SYM     = N_SLOTS * SYM_SLOT       # 140 символов на кадр
+CP_FIRST  = 10                       # первый символ слота
+CP_OTHER  = 9                        # остальные 6
+FRAME_LEN = 19200
+
+
+def load_frame(path):
+    """float32, I/Q вперемешку -> complex64"""
+    raw = np.fromfile(path, dtype=np.float32)
+    x = raw[0::2] + 1j * raw[1::2]
+    assert len(x) == FRAME_LEN, f"ожидалось {FRAME_LEN} отсчётов, получено {len(x)}"
+    return x.astype(np.complex64)
+
+
+def extract_useful_re(x):
+    """
+    x: complex, 19200 отсчётов.
+    Возвращает grid[sym, sc]: shape (140, 72)
+    sc = 0..71 -> частоты от самой нижней к самой верхней (DC пропущен).
+    """
+    grid = np.empty((N_SYM, N_USED), dtype=np.complex64)
+
+    # индексы бинов FFT: -36..-1 -> 92..127, затем +1..+36 -> 1..36
+    bins = np.r_[N_FFT - N_USED // 2 : N_FFT, 1 : N_USED // 2 + 1]
+
+    pos = 0
+    for sym in range(N_SYM):
+        cp = CP_FIRST if sym % SYM_SLOT == 0 else CP_OTHER
+        pos += cp                                   # пропускаем CP
+        td = x[pos : pos + N_FFT]
+        pos += N_FFT
+
+        fd = np.fft.fft(td)
+        grid[sym] = fd[bins]
+
+    assert pos == FRAME_LEN 
+    return grid
 
 
 
@@ -210,50 +236,19 @@ SAMPLE_RATE = 1.92e6
 FFT_SIZE = PRB_TO_FFT_SIZE[PRB]
 CP_TYPE = "normal"
 
-FILE_PATH = "lte_pss_sss_pbch_iq_s16le.pcm"
+FILE_PATH = "lte_frame_time.bin"
 
-raw_data = np.fromfile(FILE_PATH, dtype=np.int16)
+gain_db = 1
 
-iq_matrix = raw_data.reshape(-1, 2)
+null_pos = np.fromfile("lte_null_pos.bin", dtype=np.int32)
+null_pos = np.asarray(null_pos)
 
-I = iq_matrix[:, 0]
-Q = iq_matrix[:, 1]
-iq_signal = I + 1j * Q
+rs_pos = np.fromfile("lte_rs_pos.bin", dtype=np.int32)
+samples = np.fromfile("lte_frame_fc32.bin", dtype=np.complex64)
+samples = samples.astype(np.complex256)
+samples = samples = extract_useful_re(samples)
 
-iq_signal = normalize_samples(iq_signal)
+samples = [item for sample in samples for item in sample]
+samples = np.array(samples)
 
-plt.figure(figsize=(12, 5))
-
-dt = 1/SAMPLE_RATE
-
-for root in ROOTS:
-    full_symbol, _ = generate_pss(root, FFT_SIZE, CP_TYPE)
-
-    correlation = norm_corr(iq_signal, full_symbol)
-    
-    plt.plot(np.arange(len(correlation)) * dt, correlation, label="root = " + str(root))
-    
-    peaks, properties = find_peaks(
-        correlation, 
-        height=0.8, 
-        distance=FFT_SIZE
-    )
-    
-plt.xlabel("time")
-plt.ylabel("correlation")
-plt.title("PSS correlation")
-plt.legend()
-plt.grid(True)
-plt.show()
-    
-symbols = get_ofdm_symbols(iq_signal, FFT_SIZE, "normal")
-symbols_wo_cp = delete_cp(symbols, FFT_SIZE, CP_TYPE)
-symbols_in_spec = fft(symbols_wo_cp, FFT_SIZE)
-useful_symbols = get_useful_re(symbols_in_spec, FFT_SIZE, PRB)
-useful_symbols, rs = extract_rs_signals(useful_symbols, 67, 0)
-
-print(rs[4])
-
-plt.scatter(np.real(useful_symbols[4]), np.imag(useful_symbols[4]))
-plt.show()
-
+print(*samples)
